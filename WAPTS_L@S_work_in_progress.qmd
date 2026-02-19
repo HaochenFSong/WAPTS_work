@@ -1173,7 +1173,8 @@ library(ggplot2)
 library(purrr)
 
 # --- settings ---
-burnin    <- 10
+burnin    <-10
+k <- 10
 n         <- 239
 seeds     <- 1024:3024
 effect_sizes <- c(0.05, 0.10, 0.20, 0.30)
@@ -1188,7 +1189,7 @@ gen_rates_flex <- function(K = 10, theta_min = 0.5, Delta = 0.1, eps = 1e-6) {
 
 run_simulation_flex <- function(seed, method_func, Delta, ..., eps_lenient) {
   set.seed(seed)
-  rates <- gen_rates_flex(K = 10, theta_min = theta_min, Delta = Delta)
+  rates <- gen_rates_flex(K = k, theta_min = theta_min, Delta = Delta)
 
   out <- method_func(success_rates = rates, burnin = burnin, n = n, ...)
 
@@ -1337,7 +1338,7 @@ p <- ggplot(combined_agg,
   scale_fill_manual( values = c(UR = "yellow", TS = "#1f78b4", WAPTS = "#e31a1c", "WAPTS_rescue" = "purple", "WAPTS_tempered" = "orange","WAPTS-CS" = "green"), name = "Policy") +
   scale_linetype_manual(values = c(UR = "longdash", TS = "longdash", WAPTS = "solid", "WAPTS_rescue" = 'solid', "WAPTS_tempered" = "solid","WAPTS-CS" = "solid"), name = "Policy") +
   labs(
-    title = "Trajectories: (1) bias(posterior mean - true), (2) average reward, (3) P(select optimal), (4) Lenient Regret, (5) P(select bad)",
+    title = "Trajectories: (1) average reward, (2) Lenient Regret, (3) bias(posterior mean - true), (4) P(select optimal), (5) P(select bad)",
     x = "Time t",
     y = NULL
   ) +
