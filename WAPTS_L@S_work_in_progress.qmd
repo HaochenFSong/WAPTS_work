@@ -1,0 +1,1729 @@
+---
+title: "WAPTS_L@S_work_in_progress"
+format: html
+editor: visual
+---
+
+# WAPTS Codebase for L\@S work in progress submission
+
+We will use this code base to provide a base for simulations that we run
+in WAPTS work.\
+
+# Part I: Policy codebase
+
+We will outline the following adaptive policy algorithms used in the
+paper.
+
+## Policy 1: Uniform Random Policy
+
+```{r}
+UR_multi <- function(success_rates, n, burnin = 1, batch = 1) {
+  # by default let's make sure the pb is the correct arm
+  # List: tracking successes and failures under each arm
+  # ex. [0,1,1,1,2,3,3,4,5,6], final index value indicates total number of successes/failures
+  K = length(success_rates)
+  # add delta:
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+  outcomes = list()
+  for (k in 1:K){
+    outcomes[[paste("arm", k, sep = "_")]] = rbinom(n, 1, success_rates[k])
+  }
+
+  arm_successes <- array(0, dim=c(K, n))
+  arm_failures <- array(0, dim=c(K, n))
+  
+  # List: tracking only the current number of successes and failures (Value changes for each iteration)
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  # History that tracks if there the correct arm is allocated
+  # ex. [1,0,1,1,0,1] 1 indicates the correct arm was allocated for the trial, 0 indicates a wrong arm is allocated, we'll make the assumption that only the last arm is correct
+  abl <- c()
+  history <- c()
+  regret <- c()
+  
+  AP = c()
+  
+  arm_selected <- c()
+  
+  # ---------- BURNIN PERIOD: use Uniform Random (UR) sampling only ----------
+  
+  for (i in 1:n) {
+    
+    draw_arms <- runif(K) # randomly drawing one arm out of all arms
+    arm_chosen <- which.max(draw_arms) # settle down which arm to pick
+    AP <- c(AP, 0.5)
+    
+    arm_selected[i] <- arm_chosen 
+    
+    if(arm_chosen == which.max(success_rates)){
+      abl[i] <- 1
+    }
+    else{
+      abl[i] <- 0
+    }
+    history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+    if (history[i] == 1) {
+      arm_s[arm_chosen] <- arm_s[arm_chosen] + 1}
+    else {
+      arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+      }
+
+    # Tracking the build-up of total number of successes, failures, for arm a & b
+    arm_successes[ , i] <- arm_s
+    arm_failures[ , i] <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+  
+  # todo: adding in the calculation on Wald_score:
+  final_success <- arm_successes[,n]
+  final_failure <- arm_failures[,n]
+  
+  Wald_score <- c()
+  
+  p_optimal <- 0 
+  try(p_optimal <- final_success[1]/(final_failure[1] + final_success[1]))
+  for (k in 2:K){
+    if (final_success[k] == 0 & final_failure[k] == 0){
+      p_arm <- 0
+      p_avg <- p_optimal
+    }
+    else{
+      p_arm <- final_success[k]/(final_failure[k] + final_success[k])
+      p_avg <- (final_success[k] + final_success[K])/(final_failure[k] + final_success[k]+ final_failure[K] + final_success[K])
+    }
+    wald <- (p_optimal - p_arm) / sqrt(p_avg*(1-p_avg)*(1/(final_failure[k]+final_success[k]) + 1/(final_failure[K]+final_success[K])))
+    Wald_score <- c(Wald_score, wald)
+  }
+  reject <-  all(Wald_score > qnorm(1-0.05)) 
+  if (is.na(reject) == TRUE){
+    reject <- FALSE 
+  }
+  #return(list(WaldScore = WaldScore[n], reward = reward[n], AP = AP[n], APT = APT))
+  #return(c(WaldScore[n], expected_reward, actual_reward, AP[n], APT))
+  return(list(arm_successes = arm_successes[,n],
+              arm_failures = arm_failures[,n],
+              reject = reject,
+              correct_rate = sum(abl)/n,
+              regret = regret,
+              history = history,
+              arm_selected = arm_selected,
+              arm_success_history = arm_successes,
+              arm_failure_history = arm_failures))
+}
+```
+
+```{r}
+# mock trial:
+# set.seed(1)
+UR_multi(success_rates = c(0.4,0.4,0.6), n = 20)
+```
+
+## Policy 2: Sub-Sampled (SS) Greedy Method:
+
+Referring from the following paper:
+
+<https://proceedings.neurips.cc/paper_files/paper/2020/file/12d16adf4a9355513f9d574b76087a08-Paper.pdf>
+
+```{r}
+SS_greedy <- function(success_rates, n, burnin = 1, batch = 1) {
+  # SS-Greedy (Algorithm 4): sample m arms uniformly, then run Greedy on that subset.
+  # Keeps the SAME input signature + returns the SAME list fields as UR_multi().
+  #
+  # Interpretation of args (to preserve your signature):
+  # - burnin: number of initial pulls per arm in the subsample (>=1 recommended)
+  # - batch: used as subsample size m when > 1; otherwise defaults to ceiling(sqrt(n))
+
+  K <- length(success_rates)
+
+  # Regret baseline
+  p_star <- max(success_rates)
+  delta  <- p_star - success_rates
+
+  # Pre-generate outcomes for reproducibility/consistency with UR_multi
+  outcomes <- vector("list", K)
+  names(outcomes) <- paste("arm", 1:K, sep = "_")
+  for (k in 1:K) {
+    outcomes[[k]] <- rbinom(n, 1, success_rates[k])
+  }
+
+  arm_successes <- array(0, dim = c(K, n))
+  arm_failures  <- array(0, dim = c(K, n))
+
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  abl <- rep(0, n)
+  history <- rep(NA_integer_, n)
+  regret  <- rep(NA_real_, n)
+  arm_selected <- rep(NA_integer_, n)
+
+  # --- Subsample size m (without changing your function signature) ---
+  m <- if (is.numeric(batch) && length(batch) == 1 && batch > 1) {
+    min(K, as.integer(batch))
+  } else {
+    min(K, as.integer(ceiling(sqrt(n))))
+  }
+
+  # Sample subset S uniformly at random (without replacement)
+  S <- sample.int(K, size = m, replace = FALSE)
+  S <- sample(S)  # randomize the order used in the initial pulls
+
+  # --- Initial phase: pull each arm in S 'burnin' times (or until horizon ends) ---
+  burnin <- max(1L, as.integer(burnin))
+  t <- 1L
+  while (t <= n && t <= m * burnin) {
+    arm_chosen <- S[((t - 1L) %% m) + 1L]
+
+    arm_selected[t] <- arm_chosen
+    abl[t] <- as.integer(arm_chosen == which.max(success_rates))
+
+    y <- outcomes[[arm_chosen]][t]
+    history[t] <- y
+
+    if (y == 1L) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1L
+    else         arm_f[arm_chosen] <- arm_f[arm_chosen] + 1L
+
+    arm_successes[, t] <- arm_s
+    arm_failures[,  t] <- arm_f
+    regret[t] <- delta[arm_chosen]
+
+    t <- t + 1L
+  }
+
+  # --- Greedy phase on subset S: always pull empirical best arm in S ---
+  while (t <= n) {
+    pulls_S <- arm_s[S] + arm_f[S]
+    means_S <- ifelse(pulls_S > 0, arm_s[S] / pulls_S, -Inf)
+
+    # Tie-break randomly among the best empirical means
+    best_idx <- which(means_S == max(means_S))
+    arm_chosen <- S[sample(best_idx, 1L)]
+
+    arm_selected[t] <- arm_chosen
+    abl[t] <- as.integer(arm_chosen == which.max(success_rates))
+
+    y <- outcomes[[arm_chosen]][t]
+    history[t] <- y
+
+    if (y == 1L) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1L
+    else         arm_f[arm_chosen] <- arm_f[arm_chosen] + 1L
+
+    arm_successes[, t] <- arm_s
+    arm_failures[,  t] <- arm_f
+    regret[t] <- delta[arm_chosen]
+
+    t <- t + 1L
+  }
+
+  # --- A reasonable "reject" flag (keeps your output field) ---
+  # Here: compare empirical best arm in S vs every other arm in S via a Wald z-test on proportions.
+  # If any comparison is undefined, we set reject = FALSE.
+  pulls_S <- arm_s[S] + arm_f[S]
+  means_S <- ifelse(pulls_S > 0, arm_s[S] / pulls_S, NA_real_)
+  best_arm <- S[which.max(means_S)]
+
+  z_alpha <- qnorm(1 - 0.05)
+  reject <- TRUE
+  for (arm_k in setdiff(S, best_arm)) {
+    n1 <- arm_s[best_arm] + arm_f[best_arm]
+    n2 <- arm_s[arm_k]    + arm_f[arm_k]
+    if (n1 == 0 || n2 == 0) { reject <- FALSE; break }
+
+    p1 <- arm_s[best_arm] / n1
+    p2 <- arm_s[arm_k]    / n2
+    p_pool <- (arm_s[best_arm] + arm_s[arm_k]) / (n1 + n2)
+
+    denom <- sqrt(p_pool * (1 - p_pool) * (1/n1 + 1/n2))
+    if (!is.finite(denom) || denom <= 0) { reject <- FALSE; break }
+
+    wald <- (p1 - p2) / denom
+    if (!is.finite(wald) || wald <= z_alpha) { reject <- FALSE; break }
+  }
+  if (is.na(reject)) reject <- FALSE
+
+  return(list(
+    arm_successes = arm_successes[, n],
+    arm_failures  = arm_failures[, n],
+    reject        = reject,
+    correct_rate  = sum(abl) / n,
+    regret        = regret,
+    history       = history,
+    arm_selected  = arm_selected,
+    arm_success_history = arm_successes,
+    arm_failure_history = arm_failures
+  ))
+}
+```
+
+```{r}
+# sample trial:
+set.seed(1)
+SS_greedy(success_rates = c(0.4,0.4,0.6), n = 20)
+```
+
+## Policy 3: Beta Bernoulli Thompson Sampling (TS)
+
+```{r}
+TS_multi <- function(success_rates, n, burnin = 1, batch = 1) {
+  # by default let's make sure the pb is the correct arm
+  # List: tracking successes and failures under each arm
+  # ex. [0,1,1,1,2,3,3,4,5,6], final index value indicates total number of successes/failures
+  K = length(success_rates)
+  # add delta:
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+  outcomes = list()
+  for (k in 1:K){
+    outcomes[[paste("arm", k, sep = "_")]] = rbinom(n, 1, success_rates[k])
+  }
+
+  arm_successes <- array(0, dim=c(K, n))
+  arm_failures <- array(0, dim=c(K, n))
+  
+  # List: tracking only the current number of successes and failures (Value changes for each iteration)
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  # History that tracks if there the correct arm is allocated
+  # ex. [1,0,1,1,0,1] 1 indicates the correct arm was allocated for the trial, 0 indicates a wrong arm is allocated, we'll make the assumption that only the last arm is correct
+  abl <- c()
+  history <- c()
+  regret <- c()
+  
+  AP = c()
+  
+  arm_selected <- c()
+  
+  # ---------- BURNIN PERIOD: use Uniform Random (UR) sampling only ----------
+  
+  for (i in 1:burnin) {
+    
+    draw_arms <- runif(K) # randomly drawing one arm out of all arms
+    arm_chosen <- which.max(draw_arms) # settle down which arm to pick
+    
+    arm_selected[i] <- arm_chosen 
+    
+    if(arm_chosen == which.max(success_rates)){
+      abl[i] <- 1
+    }
+    else{
+      abl[i] <- 0
+    }
+    history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+    if (history[i] == 1) {
+      arm_s[arm_chosen] <- arm_s[arm_chosen] + 1}
+    else {
+      arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+      }
+
+    # Tracking the build-up of total number of successes, failures, for arm a & b
+    arm_successes[ , i] <- arm_s
+    arm_failures[ , i] <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+  
+  # ---------- AFTER BURNIN PERIOD: Use TS or UR depending on difference between posterior probabilities ----------
+  
+  for (i in (burnin + 1):n) {
+
+    # Posterior probability updates happen by batch size (whenever m becomes 0, larger batch size -> slower updates)
+    m = i %% batch 
+    
+    # Draw from Beta(alpha, beta) distribution, using only the current success & failure counts 
+    # alpha = current successes, beta = current failures of each arm
+    # CASE 1: Posterior probability of arms a & b is updated
+    if (m == 0) {
+      draw_arms <- rbeta(K, arm_successes[, i - 1] + 1, arm_failures[, i - 1] + 1)
+      
+      # AP_i just for place holder for now, not really calculating it
+      AP_i <- 0
+      AP <- c(AP, AP_i)
+    }
+    # CASE 2: Posterior probability of arms a & b is not updated
+    else {
+      draw_arms <- rbeta(K, arm_successes[, i - m] + 1, arm_failures[, i - m] + 1)
+        
+    # Using index [i - m] shows we are using the posterior probabilities from the previous batch, and not our most current success/failure counts
+    }
+    # select the chosen arm to choose
+    arm_chosen <- which.max(draw_arms)
+    arm_selected[i] <- arm_chosen 
+    
+    # adding on to the correct allocation rate
+    if(arm_chosen == which.max(success_rates)){
+      abl[i] <- 1
+    }
+    else{
+      abl[i] <- 0
+    }
+    
+    # record history of the success/failure of that select arm
+    history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+    
+    
+    # Update arm a & b history (abl), successes, and failures
+    if (history[i] == 1) {
+      arm_s[arm_chosen] <- arm_s[arm_chosen] + 1  # Update success count for chosen arm
+    } else {
+      arm_f[arm_chosen] <- arm_f[arm_chosen] + 1  # Update failure count for chosen arm
+    }
+    
+    # Tracking the build-up of total number of successes, failures, for arm a & b, adding onto successes and failures from burnin period
+    arm_successes[ , i] <- arm_s
+    arm_failures[ , i] <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  # List: complete history of number of times arms a & b were chosen (final index, total number of times chosen for each)
+  
+  # todo: adding in the calculation on Wald_score:
+  final_success <- arm_successes[,n]
+  final_failure <- arm_failures[,n]
+  
+  Wald_score <- c()
+  
+  p_optimal <- 0 
+  try(p_optimal <- final_success[1]/(final_failure[1] + final_success[1]))
+  for (k in 2:K){
+    if (final_success[k] == 0 & final_failure[k] == 0){
+      p_arm <- 0
+      p_avg <- p_optimal
+    }
+    else{
+      p_arm <- final_success[k]/(final_failure[k] + final_success[k])
+      p_avg <- (final_success[k] + final_success[K])/(final_failure[k] + final_success[k]+ final_failure[K] + final_success[K])
+    }
+    wald <- (p_optimal - p_arm) / sqrt(p_avg*(1-p_avg)*(1/(final_failure[k]+final_success[k]) + 1/(final_failure[K]+final_success[K])))
+    Wald_score <- c(Wald_score, wald)
+  }
+  reject <-  all(Wald_score > qnorm(1-0.05)) 
+  if (is.na(reject) == TRUE){
+    reject <- FALSE 
+  }
+  #return(list(WaldScore = WaldScore[n], reward = reward[n], AP = AP[n], APT = APT))
+  #return(c(WaldScore[n], expected_reward, actual_reward, AP[n], APT))
+  return(list(arm_successes = arm_successes[,n],
+              arm_failures = arm_failures[,n],
+              reject = reject,
+              correct_rate = sum(abl)/n,
+              regret = regret,
+              history = history,
+              arm_selected = arm_selected,
+              arm_success_history = arm_successes,
+              arm_failure_history = arm_failures))
+}
+```
+
+```{r}
+# mock trial:
+set.seed(1)
+TS_multi(success_rates = c(0.4,0.4,0.6), n = 20)
+```
+
+## Policy 4: Epsilon-Greedy Thompson Sampling (epsilon-TS)
+
+The code does **TS with probability** $\epsilon$ and **Greedy with
+probability** $1-\epsilon$.
+
+Referred from the following paper:
+
+<https://arxiv.org/html/2403.00540v1>
+
+```{r}
+epsilon_TS_multi <- function(success_rates, n, burnin = 1, batch = 1, epsilon = 0.1) {
+  K <- length(success_rates)
+
+  # regret baseline
+  p_star <- max(success_rates)
+  delta  <- p_star - success_rates
+
+  # pre-generate outcomes (same as your TS_multi)
+  outcomes <- list()
+  for (k in 1:K) {
+    outcomes[[paste("arm", k, sep = "_")]] <- rbinom(n, 1, success_rates[k])
+  }
+
+  arm_successes <- array(0, dim = c(K, n))
+  arm_failures  <- array(0, dim = c(K, n))
+
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  # pre-allocate
+  abl          <- rep(NA_integer_, n)
+  history      <- rep(NA_integer_, n)
+  regret       <- rep(NA_real_, n)
+  AP           <- rep(NA_real_, n)      # placeholder (like yours)
+  arm_selected <- rep(NA_integer_, n)
+
+  burnin <- as.integer(max(0, burnin))
+  burnin <- min(burnin, n)
+  batch  <- as.integer(max(1, batch))
+  epsilon <- max(0, min(1, epsilon))
+
+  # helper: random tie-breaking argmax
+  argmax_tie_random <- function(x) {
+    idx <- which(x == max(x))
+    sample(idx, 1)
+  }
+
+  # ---------- BURNIN: Uniform Random ----------
+  if (burnin > 0) {
+    for (i in 1:burnin) {
+      arm_chosen <- which.max(runif(K))
+      arm_selected[i] <- arm_chosen
+
+      abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+      history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+      if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+
+      arm_successes[, i] <- arm_s
+      arm_failures[,  i] <- arm_f
+      regret[i] <- delta[arm_chosen]
+    }
+  }
+
+  # ---------- AFTER BURNIN: (1-epsilon) Greedy, epsilon TS ----------
+  if (burnin < n) {
+
+    # store last TS posterior sample draw (for batching)
+    last_draw <- rep(NA_real_, K)
+
+    for (i in (burnin + 1):n) {
+
+      # Greedy vs TS (per Jin et al. 2023: greedy w.p. 1-epsilon, TS w.p. epsilon)
+      do_TS <- (runif(1) < epsilon)
+
+      if (!do_TS) {
+        # ---- Greedy: empirical mean using CURRENT counts ----
+        pulls <- arm_s + arm_f
+        emp_mean <- ifelse(pulls > 0, arm_s / pulls, -Inf)
+        arm_chosen <- argmax_tie_random(emp_mean)
+
+      } else {
+        # ---- TS: same batch logic as your TS_multi ----
+        m <- i %% batch
+
+        if (m == 0) {
+          # update TS posterior draws using latest counts at i-1
+          last_draw <- rbeta(K, arm_successes[, i - 1] + 1, arm_failures[, i - 1] + 1)
+          AP[i] <- 0  # placeholder
+        } else {
+          # reuse previous batch draw
+          if (any(is.na(last_draw))) {
+            # first time TS happens before any "m==0" update: draw from latest counts
+            last_draw <- rbeta(K, arm_successes[, i - 1] + 1, arm_failures[, i - 1] + 1)
+          }
+        }
+
+        arm_chosen <- argmax_tie_random(last_draw)
+      }
+
+      arm_selected[i] <- arm_chosen
+      abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+
+      history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+      if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+
+      arm_successes[, i] <- arm_s
+      arm_failures[,  i] <- arm_f
+      regret[i] <- delta[arm_chosen]
+    }
+  }
+
+  # ---------- Wald score block: kept as-is (your original logic) ----------
+  final_success <- arm_successes[, n]
+  final_failure <- arm_failures[, n]
+
+  Wald_score <- c()
+  p_optimal <- 0
+  try(p_optimal <- final_success[1] / (final_failure[1] + final_success[1]))
+
+  for (k in 2:K) {
+    if (final_success[k] == 0 && final_failure[k] == 0) {
+      p_arm <- 0
+      p_avg <- p_optimal
+    } else {
+      p_arm <- final_success[k] / (final_failure[k] + final_success[k])
+      p_avg <- (final_success[k] + final_success[K]) /
+        (final_failure[k] + final_success[k] + final_failure[K] + final_success[K])
+    }
+    wald <- (p_optimal - p_arm) / sqrt(p_avg * (1 - p_avg) *
+      (1 / (final_failure[k] + final_success[k]) + 1 / (final_failure[K] + final_success[K])))
+    Wald_score <- c(Wald_score, wald)
+  }
+
+  reject <- all(Wald_score > qnorm(1 - 0.05))
+  if (is.na(reject)) reject <- FALSE
+
+  return(list(
+    arm_successes = arm_successes[, n],
+    arm_failures  = arm_failures[, n],
+    reject        = reject,
+    correct_rate  = sum(abl, na.rm = TRUE) / n,
+    regret        = regret,
+    history       = history,
+    arm_selected  = arm_selected,
+    arm_success_history = arm_successes,
+    arm_failure_history = arm_failures
+  ))
+}
+```
+
+```{r}
+# mock trial:
+set.seed(1)
+epsilon_TS_multi(success_rates = c(0.4,0.4,0.6), n = 20)
+```
+
+## Policy 5: Beta-Bernoulli Weighted Allocation Probability Adjusted Thompson Sampling (WAPTS) 
+
+This is the main policy that we used for the paper
+
+```{r}
+WAPTS_multi_countscale_arm <- function(success_rates, n, burnin = 1, batch = 1,
+                                       rescue = FALSE,
+                                       w_min = 0.2, w_max = 1.0, c = 20) {
+
+  select_random_max <- function(rate_vector) {
+    max_val  <- max(rate_vector, na.rm = TRUE)
+    max_inds <- which(rate_vector == max_val)
+    if (length(max_inds) == 0) stop("No maximum found.")
+    if (length(max_inds) == 1) return(max_inds)
+    sample(max_inds, 1)
+  }
+
+  K <- length(success_rates)
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+
+  outcomes <- vector("list", K)
+  for (k in 1:K) outcomes[[k]] <- rbinom(n, 1, success_rates[k])
+
+  arm_successes <- array(0, dim=c(K, n))
+  arm_failures  <- array(0, dim=c(K, n))
+  arm_s <- rep(0, K); arm_f <- rep(0, K)
+
+  abl <- rep(NA_integer_, n)
+  history <- rep(NA_integer_, n)
+  regret  <- rep(NA_real_, n)
+  arm_selected <- rep(NA_integer_, n)
+
+  for (i in 1:burnin) {
+    arm_chosen <- select_random_max(runif(K))
+    arm_selected[i] <- arm_chosen
+    abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+    history[i] <- outcomes[[arm_chosen]][i]
+    if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+    arm_successes[, i] <- arm_s
+    arm_failures[, i]  <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  for (i in (burnin + 1):n) {
+
+    gamma <- K/(K+sqrt(i))
+    m <- i %% batch
+    t_idx <- if (m == 0) (i - 1) else (i - m)
+
+    s_prev <- arm_successes[, t_idx]
+    f_prev <- arm_failures[, t_idx]
+    N_prev <- s_prev + f_prev
+
+    post_mean <- ifelse(N_prev == 0, 1/2, (s_prev + 1)/(N_prev + 2))
+    arm_rate  <- (1 + post_mean) * post_mean
+
+    # ---- NEW: arm-specific count scaling ----
+    w_k <- w_min + (w_max - w_min) * (N_prev / (N_prev + c))
+
+    draw <- rbeta(K, 1 + w_k * s_prev, 1 + w_k * f_prev)
+
+    draw_arms <- if (rescue) (((1 - gamma) * arm_rate + gamma) * draw) else (arm_rate * draw)
+
+    arm_chosen <- select_random_max(draw_arms)
+    arm_selected[i] <- arm_chosen
+    abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+    history[i] <- outcomes[[arm_chosen]][i]
+
+    if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+    arm_successes[, i] <- arm_s
+    arm_failures[, i]  <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  list(
+    correct_rate = mean(abl, na.rm=TRUE),
+    regret = regret,
+    history = history,
+    arm_selected = arm_selected,
+    arm_success_history = arm_successes,
+    arm_failure_history = arm_failures
+  )
+}
+```
+
+```{r}
+select_random_max <- function(rate_vector) {
+  max_val  <- max(rate_vector, na.rm = TRUE)
+  max_inds <- which(rate_vector == max_val)
+
+  if (length(max_inds) == 0) stop("No maximum found. The rate_vector might be all NA or empty.")
+  if (length(max_inds) == 1) return(max_inds)
+  sample(max_inds, 1)
+}
+
+# ------------------------------------------------------------
+# Tempered-WAPTS: WAPTS allocation shaping + tempered TS draws
+# ------------------------------------------------------------
+WAPTS_multi_tempered <- function(success_rates, n, burnin = 1, batch = 1,
+                                 rescue = FALSE,
+                                 eta = 0.5,                 # constant tempering (0<eta<=1 typical)
+                                 eta_schedule = c("const", "adaptive"),
+                                 eta_min = 0.2, eta_max = 1.0) {
+
+  eta_schedule <- match.arg(eta_schedule)
+
+  K <- length(success_rates)
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+
+  # pre-generate outcomes (same as your original setup)
+  outcomes <- vector("list", K)
+  for (k in 1:K) outcomes[[k]] <- rbinom(n, 1, success_rates[k])
+
+  arm_successes <- array(0, dim = c(K, n))
+  arm_failures  <- array(0, dim = c(K, n))
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  abl <- rep(NA_integer_, n)
+  history <- rep(NA_integer_, n)
+  regret <- rep(NA_real_, n)
+  arm_selected <- rep(NA_integer_, n)
+
+  AP <- c()
+
+  # -----------------------
+  # Burn-in: Uniform random
+  # -----------------------
+  for (i in 1:burnin) {
+    arm_chosen <- select_random_max(runif(K))
+    arm_selected[i] <- arm_chosen
+
+    abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+    history[i] <- outcomes[[arm_chosen]][i]
+
+    if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+    arm_successes[, i] <- arm_s
+    arm_failures[, i]  <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  # -----------------------
+  # After burn-in
+  # -----------------------
+  for (i in (burnin + 1):n) {
+
+    gamma <- K / (K + sqrt(i))
+    m <- i %% batch
+
+    # choose which time index to use for "stale posterior" under batching
+    t_idx <- if (m == 0) (i - 1) else (i - m)
+
+    s_prev <- arm_successes[, t_idx]
+    f_prev <- arm_failures[, t_idx]
+    tot_prev <- s_prev + f_prev
+
+    # posterior mean used by WAPTS shaping (keep yours, but make it coherent)
+    post_mean <- ifelse(tot_prev == 0, 1/2, (s_prev + 1) / (tot_prev + 2))
+    arm_rate  <- (1 + post_mean) * post_mean
+
+    # -----------------------
+    # Tempering / power posterior
+    # -----------------------
+    # Constant eta OR adaptive eta (novel combo with WAPTS)
+    if (eta_schedule == "const") {
+      eta_t <- eta
+    } else {
+      # adaptive: conservative early (small eta), increase with time
+      # You can swap this schedule later; this is a simple monotone ramp.
+      frac <- (i - burnin) / (n - burnin)
+      eta_t <- eta_min + (eta_max - eta_min) * frac
+    }
+
+    # fractional-count Beta posterior: Beta(1 + eta*s, 1 + eta*f)
+    draw <- rbeta(K, 1 + eta_t * s_prev, 1 + eta_t * f_prev)
+
+    # rescue mixing (unchanged idea)
+    if (rescue) {
+      draw_arms <- ((1 - gamma) * arm_rate + gamma) * draw
+    } else {
+      draw_arms <- arm_rate * draw
+    }
+
+    arm_chosen <- select_random_max(draw_arms)
+    arm_selected[i] <- arm_chosen
+
+    abl[i] <- as.integer(arm_chosen == which.max(success_rates))
+    history[i] <- outcomes[[arm_chosen]][i]
+
+    if (history[i] == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1 else arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+    arm_successes[, i] <- arm_s
+    arm_failures[, i]  <- arm_f
+    regret[i] <- delta[arm_chosen]
+
+    if (m == 0) {
+      AP <- c(AP, 0)
+    }
+  }
+
+  # ---- Wald scores (kept as-is from your version; not affecting policy) ----
+  final_success <- arm_successes[, n]
+  final_failure <- arm_failures[, n]
+
+  Wald_score <- c()
+  p_optimal <- 0
+  try(p_optimal <- final_success[1] / (final_failure[1] + final_success[1]), silent = TRUE)
+
+  for (k in 2:K) {
+    if (final_success[k] == 0 && final_failure[k] == 0) {
+      p_arm <- 0
+      p_avg <- p_optimal
+    } else {
+      p_arm <- final_success[k] / (final_failure[k] + final_success[k])
+      p_avg <- (final_success[k] + final_success[1]) /
+        (final_failure[k] + final_success[k] + final_failure[1] + final_success[1])
+    }
+    wald <- (p_optimal - p_arm) / sqrt(p_avg * (1 - p_avg) *
+      (1 / (final_failure[k] + final_success[k]) + 1 / (final_failure[1] + final_success[1])))
+    Wald_score <- c(Wald_score, wald)
+  }
+
+  reject <- all(Wald_score > qnorm(1 - 0.05))
+  if (is.na(reject)) reject <- FALSE
+
+  list(
+    arm_successes = arm_successes[, n],
+    arm_failures  = arm_failures[, n],
+    reject        = reject,
+    correct_rate  = mean(abl, na.rm = TRUE),
+    regret        = regret,
+    history       = history,
+    arm_selected  = arm_selected,
+    arm_success_history = arm_successes,
+    arm_failure_history = arm_failures
+  )
+}
+```
+
+The old version of the code:
+
+```{r}
+# old version:
+select_random_max <- function(rate_vector) {
+  max_val  <- max(rate_vector, na.rm = TRUE)
+  max_inds <- which(rate_vector == max_val)
+
+  if (length(max_inds) == 0) {
+    stop("No maximum found. The rate_vector might be all NA or empty.")
+  }
+  if (length(max_inds) == 1) {
+    return(max_inds)   # <- IMPORTANT
+  }
+  sample(max_inds, 1)
+}
+
+# added rescue functionality here
+
+WAPTS_multi <- function(success_rates, n, burnin = 1, batch = 1, rescue = FALSE) {
+  # by default let's make sure the pb is the correct arm
+  # List: tracking successes and failures under each arm
+  # ex. [0,1,1,1,2,3,3,4,5,6], final index value indicates total number of successes/failures
+  K = length(success_rates)
+  # add delta:
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+  outcomes = list()
+  for (k in 1:K){
+    outcomes[[paste("arm", k, sep = "_")]] = rbinom(n, 1, success_rates[k])
+  }
+
+  arm_successes <- array(0, dim=c(K, n))
+  arm_failures <- array(0, dim=c(K, n))
+
+  # List: tracking only the current number of successes and failures (Value changes for each iteration)
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  # History that tracks if there the correct arm is allocated
+  # ex. [1,0,1,1,0,1] 1 indicates the correct arm was allocated for the trial, 0 indicates a wrong arm is allocated, we'll make the assumption that only the last arm is correct
+  abl <- c()
+  history <- c()
+  regret <- c()
+
+  AP = c()
+
+  arm_selected <- c()
+
+  # ---------- BURNIN PERIOD: use Uniform Random (UR) sampling only ----------
+
+  for (i in 1:burnin) {
+
+    draw_arms <- runif(K) # randomly drawing one arm out of all arms
+    arm_chosen <- select_random_max(draw_arms) # settle down which arm to pick
+
+    arm_selected[i] <- arm_chosen
+
+    if(arm_chosen == which.max(success_rates)){
+      abl[i] <- 1
+    }
+    else{
+      abl[i] <- 0
+    }
+    history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+    if (history[i] == 1) {
+      arm_s[arm_chosen] <- arm_s[arm_chosen] + 1}
+    else {
+      arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+      }
+
+    # Tracking the build-up of total number of successes, failures, for arm a & b
+    arm_successes[ , i] <- arm_s
+    arm_failures[ , i] <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  # ---------- AFTER BURNIN PERIOD: Use TS or UR depending on difference between posterior probabilities ----------
+
+  for (i in (burnin + 1):n) {
+
+    gamma = K/(K+sqrt(i))
+
+    # Posterior probability updates happen by batch size (whenever m becomes 0, larger batch size -> slower updates)
+    m = i %% batch
+
+    # Draw from Beta(alpha, beta) distribution, using only the current success & failure counts
+    # alpha = current successes, beta = current failures of each arm
+
+    # CASE 1: Posterior probability of arms a & b is updated
+    if (m == 0) {
+      tot_prev <- arm_failures[, i - 1] + arm_successes[, i - 1]
+
+      arm_success_rate <- ifelse(tot_prev == 0, 1,
+                                 arm_successes[, i - 1] / tot_prev)
+
+      arm_rate <- (1 + arm_success_rate) * arm_success_rate
+      # arm_success_rate <- ifelse(arm_failures[, i - 1] + arm_successes[, i - 1] == 0,
+      #                    0.5,
+      #                 (arm_successes[, i - 1]) / (arm_failures[, i - 1] + arm_successes[, i - 1]))
+      # arm_rate <- (1 + arm_success_rate) * arm_success_rate
+      draw <- rbeta(K, arm_successes[, i - 1] + 1, arm_failures[, i - 1] + 1)
+      score_wapts <- arm_rate * draw
+      score_ts    <- draw
+      if (rescue) {
+        draw_arms <- (1 - gamma) * score_wapts + gamma * score_ts
+      }
+      else {
+        draw_arms <- score_wapts
+      }
+
+
+      # AP_i just for place holder for now, not really calculating it
+      AP_i <- 0
+      AP <- c(AP, AP_i)
+    }
+    # CASE 2: Posterior probability of arms a & b is not updated
+    else {
+      arm_success_rate <- ifelse(arm_failures[, i - m] + arm_successes[, i - m] == 0,
+                         1,
+                      (arm_successes[, i - m]) / (arm_failures[, i - m] + arm_successes[, i - m]))
+      arm_rate <- (1 + arm_success_rate) * arm_success_rate
+      draw <- rbeta(K, arm_successes[, i - m] + 1, arm_failures[, i - m] + 1)
+      score_wapts <- arm_rate * draw
+      score_ts    <- draw
+      if (rescue) {
+        draw_arms <- (1 - gamma) * score_wapts + gamma * score_ts
+      }
+      else {
+        draw_arms <- score_wapts
+      }
+
+    # Using index [i - m] shows we are using the posterior probabilities from the previous batch, and not our most current success/failure counts
+    }
+    # select the chosen arm to choose
+    arm_chosen <- select_random_max(draw_arms)
+    # arm_chosen <- which.max(draw_arms)
+    arm_selected[i] <- arm_chosen
+
+    # adding on to the correct allocation rate
+    if(arm_chosen == which.max(success_rates)){
+      abl[i] <- 1
+    }
+    else{
+      abl[i] <- 0
+    }
+
+    # record history of the success/failure of that select arm
+    history[i] <- outcomes[[paste("arm", arm_chosen, sep = "_")]][i]
+
+
+    # Update arm a & b history (abl), successes, and failures
+    if (history[i] == 1) {
+      arm_s[arm_chosen] <- arm_s[arm_chosen] + 1  # Update success count for chosen arm
+    } else {
+      arm_f[arm_chosen] <- arm_f[arm_chosen] + 1  # Update failure count for chosen arm
+    }
+
+    # Tracking the build-up of total number of successes, failures, for arm a & b, adding onto successes and failures from burnin period
+    arm_successes[ , i] <- arm_s
+    arm_failures[ , i] <- arm_f
+    regret[i] <- delta[arm_chosen]
+  }
+
+  # List: complete history of number of times arms a & b were chosen (final index, total number of times chosen for each)
+
+  # todo: adding in the calculation on Wald_score:
+  final_success <- arm_successes[,n]
+  final_failure <- arm_failures[,n]
+
+  Wald_score <- c()
+
+  p_optimal <- 0
+  try(p_optimal <- final_success[1]/(final_failure[1] + final_success[1]))
+  for (k in 2:(K)){
+    if (final_success[k] == 0 & final_failure[k] == 0){
+      p_arm <- 0
+      p_avg <- p_optimal
+    }
+    else{
+      p_arm <- final_success[k]/(final_failure[k] + final_success[k])
+      p_avg <- (final_success[k] + final_success[1])/(final_failure[k] + final_success[k]+ final_failure[1] + final_success[1])
+    }
+    wald <- (p_optimal - p_arm) / sqrt(p_avg*(1-p_avg)*(1/(final_failure[k]+final_success[k]) + 1/(final_failure[1]+final_success[1])))
+    Wald_score <- c(Wald_score, wald)
+  }
+  reject <-  all(Wald_score > qnorm(1-0.05))
+  if (is.na(reject) == TRUE){
+    reject <- FALSE
+  }
+  #return(list(WaldScore = WaldScore[n], reward = reward[n], AP = AP[n], APT = APT))
+  #return(c(WaldScore[n], expected_reward, actual_reward, AP[n], APT))
+  return(list(arm_successes = arm_successes[,n],
+              arm_failures = arm_failures[,n],
+              reject = reject,
+              correct_rate = sum(abl)/n,
+              regret = regret,
+              history = history,
+              arm_selected = arm_selected,
+              arm_success_history = arm_successes,
+              arm_failure_history = arm_failures))
+}
+```
+
+```{r}
+# mock trial:
+set.seed(1)
+WAPTS_multi_tempered(success_rates = c(0.4, 0.4, 0.6),n = 20, rescue = TRUE)
+```
+
+## Policy 6: Information Relaxation Thompson Sampling in a Finite Horizon Setting (IRS-FH)
+
+This policy is used to construct policy comparison with WAPTS, this
+policy assumes a further that there is a limit on the horizon (number of
+participants) inside the experiment.
+
+The policy is found at this place:
+
+<https://papers.nips.cc/paper_files/paper/2019/file/e5b294b70c9647dcf804d7baa1903918-Paper.pdf>
+
+```{r}
+IRS_FH_multi <- function(success_rates, n, burnin = 1, batch = 1) {
+
+  K <- length(success_rates)
+  p_star <- max(success_rates)
+  delta <- p_star - success_rates
+
+  # pre-generate outcomes per arm (same style as your TS/WAPTS sims)
+  outcomes <- vector("list", K)
+  for (k in 1:K) outcomes[[k]] <- rbinom(n, 1, success_rates[k])
+
+  arm_successes <- array(0, dim = c(K, n))
+  arm_failures  <- array(0, dim = c(K, n))
+
+  arm_s <- rep(0, K)
+  arm_f <- rep(0, K)
+
+  history      <- numeric(n)
+  regret       <- numeric(n)
+  arm_selected <- integer(n)
+  abl          <- integer(n)  # correctness indicator
+
+  best_arm <- which.max(success_rates)
+
+  # ---------- burnin: uniform random ----------
+  for (i in 1:burnin) {
+
+    arm_chosen <- which.max(runif(K))
+    arm_selected[i] <- arm_chosen
+
+    y <- outcomes[[arm_chosen]][i]
+    history[i] <- y
+
+    if (y == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1
+    else        arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+
+    arm_successes[, i] <- arm_s
+    arm_failures[,  i] <- arm_f
+
+    regret[i] <- delta[arm_chosen]
+    abl[i]    <- as.integer(arm_chosen == best_arm)
+  }
+
+  # ---------- after burnin: IRS-FH index ----------
+  for (i in (burnin + 1):n) {
+
+    m <- i %% batch
+
+    # use stale batch counts like your TS/WAPTS structure
+    idx <- if (m == 0) i - 1 else i - m
+
+    # sample a posterior parameter for each arm
+    post_pis <- rbeta(K, arm_successes[, idx] + 1, arm_failures[, idx] + 1)
+
+    # finite-horizon “look-ahead” via Binomial shortcut:
+    # remaining steps including current i: (n - i + 1)
+    future <- n - i + 1
+    S_future <- rbinom(K, size = future, prob = post_pis)
+
+    draw_arms <- (arm_successes[, idx] + 1 + S_future) /
+                 (arm_successes[, idx] + arm_failures[, idx] + 2 + future)
+
+    arm_chosen <- which.max(draw_arms)
+    arm_selected[i] <- arm_chosen
+
+    y <- outcomes[[arm_chosen]][i]
+    history[i] <- y
+
+    if (y == 1) arm_s[arm_chosen] <- arm_s[arm_chosen] + 1
+    else        arm_f[arm_chosen] <- arm_f[arm_chosen] + 1
+
+    arm_successes[, i] <- arm_s
+    arm_failures[,  i] <- arm_f
+
+    regret[i] <- delta[arm_chosen]
+    abl[i]    <- as.integer(arm_chosen == best_arm)
+  }
+
+  return(list(
+    arm_successes = arm_successes[, n],
+    arm_failures  = arm_failures[, n],
+    correct_rate  = sum(abl) / n,
+    regret        = regret,
+    history       = history,
+    arm_selected  = arm_selected,
+    arm_success_history = arm_successes,
+    arm_failure_history = arm_failures
+  ))
+}
+```
+
+```{r}
+# mock trial:
+set.seed(1)
+IRS_FH_multi(success_rates = c(0.4, 0.4, 0.6),n = 20)
+```
+
+# Part II: Set Up of the Experiment and Simulation Comparison
+
+In this section, let's plan out the simulation and experiment setting of
+the study. For each of the setup, we will outline the experiment set up,
+and compare the following of reward, regret, lenient regret, posterior
+convergence of optimal arm, posterior convergence of most exploit arm.
+
+There are two setups of the experiment in our case:
+
+-   when there is a unique optimal arm in the experiment, i.e. one is
+    optimal, and the rest of arms is uniformly below the optimal arm.
+
+-   when there is more than one unique optimal arm in the experiment,
+    i.e. at least more than one arm is optimal, the rest of the arms are
+    uniformly below the good arms.
+
+## Part II-1 Experiment Setup of Unique Optimal Arm.
+
+### Part II-1.1 Flexible Gap Setting
+
+In this setup, in the simulation setting, we have one arm out of the `K`
+arms to be truly optimal, the rest of the arm is uniformly distributed
+from the range `(0.5, 0.5 + effect size - 10e-6).` We will plan out the
+simulation setting and plot the posterior mean estimate of the optimal
+arm, the average reward comparison, and the probability of selecting the
+optimal arm.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+# --- settings ---
+burnin    <- 10
+n         <- 239
+seeds     <- 1024:3024
+effect_sizes <- c(0.05, 0.10, 0.20, 0.30)
+theta_min <- 0.50
+
+# Generate success rates for flexible gap with a unique best arm
+gen_rates_flex <- function(K = 10, theta_min = 0.5, Delta = 0.1, eps = 1e-6) {
+  theta_star <- theta_min + Delta
+  subs <- pmin(runif(K - 1, min = theta_min, max = theta_star), theta_star - eps)
+  c(theta_star, subs)  # optimal arm at index 1
+}
+
+run_simulation_flex <- function(seed, method_func, Delta, ..., eps_lenient) {
+  set.seed(seed)
+  rates <- gen_rates_flex(K = 10, theta_min = theta_min, Delta = Delta)
+
+  out <- method_func(success_rates = rates, burnin = burnin, n = n, ...)
+
+  Succ <- out$arm_success_history
+  Fail <- out$arm_failure_history
+
+  # ---- Track A: optimal arm posterior mean (empirical) ----
+  s_opt <- Succ[1, ]
+  f_opt <- Fail[1, ]
+  tot_opt <- s_opt + f_opt
+  est_opt <- ifelse(tot_opt > 0, s_opt / tot_opt, NA_real_)
+  
+  # Bia estimate:
+  theta_true <- theta_min + Delta   # = 0.5 + effect size
+  bias_opt <- est_opt - theta_true
+
+  # ---- Track B: empirical average reward up to time t ----
+  y <- as.numeric(out$history)           # 0/1 reward each step
+  avg_reward <- cumsum(y) / seq_len(n)   # cummean
+
+  # ---- Track C: probability of selecting the correct arm up to time t ----
+  chosen <- as.integer(out$arm_selected)
+  p_correct <- cumsum(chosen == 1L) / seq_len(n)
+
+  # ---- Track D: epsilon-lenient regret up to time t ----
+  # r_t^eps = max(0, (theta* - eps) - theta_{a_t})
+  theta_star <- max(rates)
+  theta_chosen <- rates[chosen]
+  inst_regret_eps <- pmax(0, (theta_star - eps_lenient) - theta_chosen)
+  regret_eps_cummean <- cumsum(inst_regret_eps) / seq_len(n)
+
+  # ---- Track E: probability of selecting a truly bad arm up to time t ----
+  # truly bad: theta_k < theta* - eps
+  bad_set <- which(rates < (theta_star - eps_lenient))
+  is_bad <- chosen %in% bad_set
+  p_bad <- cumsum(is_bad) / seq_len(n)
+
+  data.frame(
+    horizon  = rep(seq_len(n), times = 5),
+    estimate = c(bias_opt, avg_reward, p_correct, regret_eps_cummean, p_bad),
+    target   = rep(c(
+      "Optimal arm (1): bias (posterior mean - true)",
+      "Average reward up to t",
+      "P(select optimal arm) up to t",
+      "Avg epsilon-lenient regret up to t (eps=0.5*Delta)",
+      "P(select truly bad arm) up to t (eps=0.5*Delta)"
+    ), each = n)
+  )
+}
+
+
+aggregate_estimates <- function(sim_list, method_name, effect_size) {
+  bind_rows(sim_list, .id = "rep") |>
+    group_by(target, horizon) |>
+    summarise(
+      estimate_mean = mean(estimate, na.rm = TRUE),
+      ci_lower      = quantile(estimate, 0.025, na.rm = TRUE),
+      ci_upper      = quantile(estimate, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(method = method_name, effect_size = effect_size)
+}
+
+# --- run sims & aggregate ---
+results <- map(effect_sizes, function(Delta) {
+  eps_lenient <- 0.5*Delta
+  sims_UR <-  lapply(
+    seeds, run_simulation_flex,
+    method_func = UR_multi,
+    Delta = Delta,
+    eps_lenient = eps_lenient
+  )
+  sims_TS <- lapply(
+    seeds, run_simulation_flex,
+    method_func = TS_multi,
+    Delta = Delta,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi,
+    Delta = Delta,
+    rescue = FALSE,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_rescue <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi,
+    Delta = Delta,
+    rescue = TRUE,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_tempered <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi_tempered,
+    Delta = Delta,
+    rescue = FALSE,
+    eta_schedule = "adaptive",
+    eta_min = 0.2, eta_max = 1.0,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_cs <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi_countscale_arm,
+    Delta = Delta,
+    rescue = FALSE,
+    w_min = 0.2, w_max = 1.0, c = 20,
+    eps_lenient = eps_lenient
+  )
+  bind_rows(
+    aggregate_estimates(sims_UR,    "UR",    Delta),
+    aggregate_estimates(sims_TS,    "TS",    Delta),
+    aggregate_estimates(sims_WAPTS, "WAPTS", Delta),
+    # aggregate_estimates(sims_WAPTS_rescue, "WAPTS_rescue", Delta)
+    # aggregate_estimates(sims_WAPTS_tempered, "WAPTS_tempered", Delta),
+    # aggregate_estimates(sims_WAPTS_cs, "WAPTS-CS",   Delta)
+  )
+})
+
+combined_agg <- bind_rows(results) |>
+  mutate(
+    # method = factor(method, levels = c("TS", "WAPTS", "WAPTS_rescue")),
+    method = factor(method, levels = c("UR", "TS", "WAPTS")),
+    # method = factor(method, levels = c("TS", "WAPTS", "WAPTS_tempered", "WAPTS-CS")),
+    effect_size_f = factor(effect_size, levels = effect_sizes,
+                           labels = paste0("Effect Size = ", format(effect_sizes, nsmall = 2))),
+    target = factor(target, levels = c(
+      "Optimal arm (1): bias (posterior mean - true)",
+      "Average reward up to t",
+      "P(select optimal arm) up to t",
+      "Avg epsilon-lenient regret up to t (eps=0.5*Delta)",
+      "P(select truly bad arm) up to t (eps=0.5*Delta)"
+    ))
+  )
+
+p <- ggplot(combined_agg,
+            aes(x = horizon, y = estimate_mean,
+                color = method, fill = method, linetype = method)) +
+  geom_vline(xintercept = burnin, linetype = "longdash",
+             color = "grey55", linewidth = 0.6, show.legend = FALSE) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.1) +
+  facet_grid(target ~ effect_size_f, scales = "free_y") +
+  coord_cartesian(expand = FALSE) +
+  scale_color_manual(values = c(UR = "yellow", TS = "#1f78b4", WAPTS = "#e31a1c", "WAPTS_rescue" = "purple", "WAPTS_tempered" = "orange","WAPTS-CS" = "green" ), name = "Policy") +
+  scale_fill_manual( values = c(UR = "yellow", TS = "#1f78b4", WAPTS = "#e31a1c", "WAPTS_rescue" = "purple", "WAPTS_tempered" = "orange","WAPTS-CS" = "green"), name = "Policy") +
+  scale_linetype_manual(values = c(UR = "longdash", TS = "longdash", WAPTS = "solid", "WAPTS_rescue" = 'solid', "WAPTS_tempered" = "solid","WAPTS-CS" = "solid"), name = "Policy") +
+  labs(
+    title = "Trajectories: (1) bias(posterior mean - true), (2) average reward, (3) P(select optimal), (4) Lenient Regret, (5) P(select bad)",
+    x = "Time t",
+    y = NULL
+  ) +
+  geom_hline(
+        data = data.frame(target = "Optimal arm (1): bias (posterior mean - true)"),
+        aes(yintercept = 0),
+        color = "grey55", linewidth = 0.5, inherit.aes = FALSE
+      ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position   = "bottom",
+    strip.text        = element_text(size = 12, face = "bold"),
+    panel.grid.minor  = element_blank()
+  )
+
+print(p)
+
+
+# To Save the Output
+p <- p + theme(
+  plot.margin = ggplot2::margin(10, 80, 10, 10),
+  strip.text.y.right = element_text(angle = 0)
+)
+
+ggsave("only_opt_plot.png_flexible_gap.png", plot = p, width = 14, height = 7, dpi = 300)
+```
+
+### Part II-1.2 Fixed Gap Setting:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+# --- settings ---
+burnin    <- 10
+n         <- 239
+seeds     <- 1024:3024
+effect_sizes <- c(0.05, 0.10, 0.20, 0.30)
+theta_min <- 0.50
+
+# Generate success rates for flexible gap with a unique best arm
+gen_rates_flex <- function(K = 10, theta_min = 0.5, Delta = 0.1, eps = 1e-6) {
+  theta_star <- theta_min + Delta
+  subs <- rep(0.5, K-1)
+  c(theta_star, subs)  # optimal arm at index 1
+}
+
+run_simulation_flex <- function(seed, method_func, Delta, ..., eps_lenient) {
+  set.seed(seed)
+  rates <- gen_rates_flex(K = 10, theta_min = theta_min, Delta = Delta)
+
+  out <- method_func(success_rates = rates, burnin = burnin, n = n, ...)
+
+  Succ <- out$arm_success_history
+  Fail <- out$arm_failure_history
+
+  # ---- Track A: optimal arm posterior mean (empirical) ----
+  s_opt <- Succ[1, ]
+  f_opt <- Fail[1, ]
+  tot_opt <- s_opt + f_opt
+  est_opt <- ifelse(tot_opt > 0, s_opt / tot_opt, NA_real_)
+
+  # ---- Track B: empirical average reward up to time t ----
+  y <- as.numeric(out$history)           # 0/1 reward each step
+  avg_reward <- cumsum(y) / seq_len(n)   # cummean
+
+  # ---- Track C: probability of selecting the correct arm up to time t ----
+  chosen <- as.integer(out$arm_selected)
+  p_correct <- cumsum(chosen == 1L) / seq_len(n)
+
+  # ---- Track D: epsilon-lenient regret up to time t ----
+  # r_t^eps = max(0, (theta* - eps) - theta_{a_t})
+  theta_star <- max(rates)
+  theta_chosen <- rates[chosen]
+  inst_regret_eps <- pmax(0, (theta_star - eps_lenient) - theta_chosen)
+  regret_eps_cummean <- cumsum(inst_regret_eps) / seq_len(n)
+
+  # ---- Track E: probability of selecting a truly bad arm up to time t ----
+  # truly bad: theta_k < theta* - eps
+  bad_set <- which(rates < (theta_star - eps_lenient))
+  is_bad <- chosen %in% bad_set
+  p_bad <- cumsum(is_bad) / seq_len(n)
+
+  data.frame(
+    horizon  = rep(seq_len(n), times = 5),
+    estimate = c(est_opt, avg_reward, p_correct, regret_eps_cummean, p_bad),
+    target   = rep(c(
+      "Optimal arm (1): posterior mean",
+      "Average reward up to t",
+      "P(select optimal arm) up to t",
+      "Avg epsilon-lenient regret up to t (eps=0.5*Delta)",
+      "P(select truly bad arm) up to t (eps=0.5*Delta)"
+    ), each = n)
+  )
+}
+
+
+aggregate_estimates <- function(sim_list, method_name, effect_size) {
+  bind_rows(sim_list, .id = "rep") |>
+    group_by(target, horizon) |>
+    summarise(
+      estimate_mean = mean(estimate, na.rm = TRUE),
+      ci_lower      = quantile(estimate, 0.025, na.rm = TRUE),
+      ci_upper      = quantile(estimate, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(method = method_name, effect_size = effect_size)
+}
+
+# --- run sims & aggregate ---
+results <- map(effect_sizes, function(Delta) {
+  eps_lenient <- 0.5*Delta
+  sims_TS <- lapply(
+    seeds, run_simulation_flex,
+    method_func = TS_multi,
+    Delta = Delta,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi,
+    Delta = Delta,
+    rescue = FALSE,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_rescue <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi,
+    Delta = Delta,
+    rescue = TRUE,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_tempered <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi_tempered,
+    Delta = Delta,
+    rescue = FALSE,
+    eta_schedule = "adaptive",
+    eta_min = 0.2, eta_max = 1.0,
+    eps_lenient = eps_lenient
+  )
+  sims_WAPTS_cs <- lapply(
+    seeds, run_simulation_flex,
+    method_func = WAPTS_multi_countscale_arm,
+    Delta = Delta,
+    rescue = FALSE,
+    w_min = 0.2, w_max = 1.0, c = 20,
+    eps_lenient = eps_lenient
+  )
+  bind_rows(
+    aggregate_estimates(sims_TS,    "TS",    Delta),
+    aggregate_estimates(sims_WAPTS, "WAPTS", Delta),
+    # aggregate_estimates(sims_WAPTS_rescue, "WAPTS_rescue", Delta)
+    # aggregate_estimates(sims_WAPTS_tempered, "WAPTS_tempered", Delta),
+    # aggregate_estimates(sims_WAPTS_cs, "WAPTS-CS",   Delta)
+  )
+})
+
+combined_agg <- bind_rows(results) |>
+  mutate(
+    # method = factor(method, levels = c("TS", "WAPTS", "WAPTS_rescue")),
+    method = factor(method, levels = c("TS", "WAPTS")),
+    # method = factor(method, levels = c("TS", "WAPTS", "WAPTS_tempered", "WAPTS-CS")),
+    effect_size_f = factor(effect_size, levels = effect_sizes,
+                           labels = paste0("Effect Size = ", format(effect_sizes, nsmall = 2))),
+    target = factor(target, levels = c(
+      "Optimal arm (1): posterior mean",
+      "Average reward up to t",
+      "P(select optimal arm) up to t",
+      "Avg epsilon-lenient regret up to t (eps=0.5*Delta)",
+      "P(select truly bad arm) up to t (eps=0.5*Delta)"
+    ))
+  )
+
+p <- ggplot(combined_agg,
+            aes(x = horizon, y = estimate_mean,
+                color = method, fill = method, linetype = method)) +
+  geom_vline(xintercept = burnin, linetype = "longdash",
+             color = "grey55", linewidth = 0.6, show.legend = FALSE) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.1) +
+  coord_cartesian(expand = FALSE) +
+  facet_grid(target ~ effect_size_f) +
+  scale_color_manual(values = c(TS = "#1f78b4", WAPTS = "#e31a1c", "WAPTS_rescue" = "purple", "WAPTS_tempered" = "orange","WAPTS-CS" = "green" ), name = "Policy") +
+  scale_fill_manual( values = c(TS = "#1f78b4", WAPTS = "#e31a1c", "WAPTS_rescue" = "purple", "WAPTS_tempered" = "orange","WAPTS-CS" = "green"), name = "Policy") +
+  scale_linetype_manual(values = c(TS = "longdash", WAPTS = "solid", "WAPTS_rescue" = 'solid', "WAPTS_tempered" = "solid","WAPTS-CS" = "solid"), name = "Policy") +
+  labs(
+    title = "Trajectories: (1) optimal arm mean, (2) average reward, (3) P(select optimal), (4) Lenient Regret, (5) P(select bad)",
+    x = "Time t",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position   = "bottom",
+    strip.text        = element_text(size = 12, face = "bold"),
+    panel.grid.minor  = element_blank()
+  )
+
+print(p)
+
+
+# To Save the Output
+p <- p + theme(
+  plot.margin = ggplot2::margin(10, 80, 10, 10),
+  strip.text.y.right = element_text(angle = 0)
+)
+
+ggsave("only_opt_plot.png_fixed_gap.png", plot = p, width = 14, height = 7, dpi = 300)
+```
+
+## Part II-2 Experiment Setup of multiple Optimal Arm.
+
+In this setup, in the simulation setting, we have `M` arms out of the
+`K` arms to be truly optimal, where `M <= K` .
+
+The rest of the arm is uniformly distributed from the range
+`(0.5, 0.5 + effect size - 10e-6).` We will plan out the simulation
+setting and plot the posterior mean estimate of the optimal arm, the
+average reward comparison, and the probability of selecting the optimal
+arm.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(purrr)
+
+# --- settings ---
+burnin      <- 10
+n           <- 239
+seeds       <- 1024:3024
+effect_sizes <- c(0.05, 0.10, 0.20, 0.30)
+theta_min   <- 0.50
+K           <- 10
+M_opt       <- 4   # optimal arms are indices 1:M_opt
+
+# ----------------------------
+# Generate success rates with M optimal arms and K-M suboptimal arms
+# ----------------------------
+gen_rates_multiopt <- function(K = 10, M = 4, theta_min = 0.5, Delta = 0.1, eps = 1e-6) {
+  stopifnot(M >= 1, M < K)
+  theta_star <- theta_min + Delta
+
+  optimal <- rep(theta_star, M)
+  subs <- pmin(runif(K - M, min = theta_min, max = theta_star), theta_star - eps)
+
+  c(optimal, subs)
+}
+
+# ----------------------------
+# One simulation run: return trajectories for
+# (A) mean estimate over optimal arms (1:M)
+# (B) empirical average reward up to time t
+# (C) P(select optimal arm) up to time t
+# ----------------------------
+run_simulation_multiopt <- function(seed, method_func, Delta, K = 10, M = 4, ...) {
+  set.seed(seed)
+
+  rates <- gen_rates_multiopt(K = K, M = M, theta_min = theta_min, Delta = Delta)
+  out <- method_func(success_rates = rates, burnin = burnin, n = n, ...)
+
+  Succ <- out$arm_success_history  # K x n
+  Fail <- out$arm_failure_history  # K x n
+
+  # ---- Track A: pooled empirical mean across ALL optimal arms (1:M) ----
+  est_opt_group <- vapply(seq_len(n), function(t) {
+    s <- sum(Succ[1:M, t])
+    f <- sum(Fail[1:M, t])
+    tt <- s + f
+    if (tt > 0) s / tt else NA_real_
+  }, numeric(1))
+
+  # ---- Track B: empirical average reward up to time t ----
+  y <- as.numeric(out$history)          # 0/1 reward each step
+  avg_reward <- cumsum(y) / seq_len(n)  # cummean reward
+
+  # ---- Track C: running probability of selecting an optimal arm (1:M) ----
+  chosen <- as.integer(out$arm_selected)
+  is_opt <- chosen %in% seq_len(M)
+  p_select_opt <- cumsum(is_opt) / seq_len(n)
+
+  data.frame(
+    horizon  = rep(seq_len(n), times = 3),
+    estimate = c(est_opt_group, avg_reward, p_select_opt),
+    target   = rep(c(
+      paste0("Optimal arms (1–", M, ") mean"),
+      "Average reward up to t",
+      paste0("P(select optimal arm in 1–", M, ") up to t")
+    ), each = n)
+  )
+}
+
+# ----------------------------
+# Aggregate across simulation reps into mean and 95% interval band
+# ----------------------------
+aggregate_estimates <- function(sim_list, method_name, effect_size) {
+  bind_rows(sim_list, .id = "rep") |>
+    group_by(target, horizon) |>
+    summarise(
+      estimate_mean = mean(estimate, na.rm = TRUE),
+      ci_lower      = quantile(estimate, 0.025, na.rm = TRUE),
+      ci_upper      = quantile(estimate, 0.975, na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(method = method_name, effect_size = effect_size)
+}
+
+# ----------------------------
+# Run sims & aggregate for each effect size
+# ----------------------------
+results <- map(effect_sizes, function(Delta) {
+  sims_TS <- lapply(
+    seeds, run_simulation_multiopt,
+    method_func = TS_multi, Delta = Delta, K = K, M = M_opt
+  )
+
+  sims_WAPTS <- lapply(
+    seeds, run_simulation_multiopt,
+    method_func = WAPTS_multi, Delta = Delta, K = K, M = M_opt,
+    rescue = FALSE
+  )
+
+  bind_rows(
+    aggregate_estimates(sims_TS,    "TS",    Delta),
+    aggregate_estimates(sims_WAPTS, "WAPTS", Delta)
+  )
+})
+
+combined_agg <- bind_rows(results) |>
+  mutate(
+    method = factor(method, levels = c("TS", "WAPTS")),
+    effect_size_f = factor(
+      effect_size,
+      levels = effect_sizes,
+      labels = paste0("Effect Size = ", format(effect_sizes, nsmall = 2))
+    ),
+    target = factor(
+      target,
+      levels = c(
+        paste0("Optimal arms (1–", M_opt, ") mean"),
+        "Average reward up to t",
+        paste0("P(select optimal arm in 1–", M_opt, ") up to t")
+      )
+    )
+  )
+
+# ----------------------------
+# Plot
+# ----------------------------
+p <- ggplot(
+  combined_agg,
+  aes(x = horizon, y = estimate_mean,
+      color = method, fill = method, linetype = method)
+) +
+  geom_vline(
+    xintercept = burnin, linetype = "longdash",
+    color = "grey55", linewidth = 0.6, show.legend = FALSE
+  ) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.14, color = NA) +
+  geom_line(linewidth = 1.1) +
+  coord_cartesian(ylim = c(0, 1), expand = FALSE) +
+  facet_grid(target ~ effect_size_f) +
+  scale_color_manual(values = c(TS = "#1f78b4", WAPTS = "#e31a1c"), name = "Policy") +
+  scale_fill_manual( values = c(TS = "#1f78b4", WAPTS = "#e31a1c"), name = "Policy") +
+  scale_linetype_manual(values = c(TS = "solid", WAPTS = "longdash"), name = "Policy") +
+  labs(
+    title    = "Trajectories with multiple optimal arms",
+    subtitle = paste0("K=", K, ", optimal arms=", M_opt),
+    x = "Time t",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position   = "bottom",
+    strip.text        = element_text(size = 12, face = "bold"),
+    panel.grid.minor  = element_blank()
+  )
+
+print(p)
+
+# To Save the Output Graph
+
+p <- p + theme(
+  plot.margin = ggplot2::margin(10, 80, 10, 10),
+  strip.text.y.right = element_text(angle = 0)
+)
+
+ggsave("multi_opt_plot.png", plot = p, width = 14, height = 7, dpi = 300)
+```
